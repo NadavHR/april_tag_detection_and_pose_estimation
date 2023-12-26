@@ -20,6 +20,21 @@ def detect_april_tags(image: np.ndarray) -> tuple[list[list[list[int]]], list[in
         return [], []
     return [a[0] for a in proj_squares], [a[0] for a in ids]
 
+def project_point(point: np.ndarray, focal_length_x: float, focal_length_y: float, width: int, height: int) -> np.ndarray:
+    """
+    :param point: the camera oriented 3d point you want to project
+    :param focal_length_x: the focal length in the x axis (tan(fov_x/2)*2) * diagonal
+    :param focal_length_y: the focal length in the y axis (tan(fov_y/2)*2) * diagonal
+    :param width: frame width
+    :param height: frame height
+    :return: the point in the frame
+    """
+    intrinsic = np.array([[focal_length_x, 0 , width],
+                        [0, focal_length_y, height],
+                        [0,          0,         1]])
+    p = intrinsic @ point
+    p /= p[2]
+    return p[:2] - (0.5*np.array([width, height]))
 
 def find_projected_tag_center(tag: list[list[int or float]]) -> list[int or float]:
     """
@@ -75,7 +90,7 @@ def diagonal_to_camera_oriented(p1_normalized: np.ndarray, p2_normalized: np.nda
     scale = diagonal_length / np.linalg.norm(p2 - p1)
     p1 *= scale
     p2 *= scale
-    return np.append(p1, 1), np.append(p2, 1)
+    return p1, p2
 
 
 def tag_projected_points_to_camera_oriented(tag: list[list[int or float]],
@@ -86,9 +101,9 @@ def tag_projected_points_to_camera_oriented(tag: list[list[int or float]],
     :param width: the images's width in pixels
     :param height: the image's height in pixels
     :param diagonal_length: the length of the tags diagonal in real life
-    :param focal_length_x: the focal length in the x axis (tan(fov_x/2)*2) * width
-    :param focal_length_y: the focal length in the y axis (tan(fov_y/2)*2) * height
-    :return: a 4*4 matrix of each corners position as in the same order as the original tag with the last row being 1's
+    :param focal_length_x: the focal length in the x axis (tan(fov_x/2)*2) * diagonal
+    :param focal_length_y: the focal length in the y axis (tan(fov_y/2)*2) * diagonal
+    :return: a 3*4 matrix of each corners position as in the same order as the original tag
     """
     normalized_corners = [screen_point_to_normalized_vector(corner, width, height, focal_length_x, focal_length_y)
                           for corner in tag]
@@ -98,28 +113,68 @@ def tag_projected_points_to_camera_oriented(tag: list[list[int or float]],
                                          normalized_center, diagonal_length)
     p2, p4 = diagonal_to_camera_oriented(normalized_corners[1], normalized_corners[3],
                                          normalized_center, diagonal_length)
+
+    center1 = (p1 + p3) * 0.5
+    center2 = (p2 + p4) * 0.5
+    center_avg_mag = np.linalg.norm((center1 + center2) * 0.5)
+    d1_scale = center_avg_mag / np.linalg.norm(center1)
+    d2_scale = center_avg_mag / np.linalg.norm(center2)
+    p1 *= d1_scale
+    p3 *= d1_scale
+    p2 *= d2_scale
+    p4 *= d2_scale
     return np.column_stack([p1, p2, p3, p4])
+
+
+def corners_to_camera_oriented_axis_matrix(corners: np.ndarray, half_tag_side_length: float) -> np.ndarray:
+    """
+    :param corners: the 3*4 matrix of the tags corners
+    :param half_tag_side_length: the length of half a tag's side
+    :return: a 4*4 matrix of the location of the xyz vectors with the length of half the side length and the 3d 0 vector
+    with the last row being 1's in camera oriented coordinates
+    """
+    center = 0.5 * (corners[:3, 0] + corners[:3, 2])
+
+    x = 0.5*(corners[:3, 0] + corners[:3, 3]) - center
+    x *= (half_tag_side_length/np.linalg.norm(x))
+    x += center
+    y = 0.5*(corners[:3, 2] + corners[:3, 3]) - center
+    y *= (half_tag_side_length/np.linalg.norm(y))
+    y += center
+
+    cross = np.cross(corners[:3, 1] - center, corners[:3, 0] - center)
+    z = center + (cross / np.linalg.norm(cross) * half_tag_side_length)
+    return np.vstack([np.column_stack([x, y, z, center]), [1, 1, 1, 1]])
+
+
 
 
 def camera_oriented_to_extrinsic_matrix(camera_oriented_tag_matrix: np.ndarray, field_oriented_tag_inverse_matrix) \
         -> np.ndarray:
     """
-    :param camera_oriented_tag_matrix:  the 4*4 matrix of the camera oriented position of the each corner tag with the
-    order being the same as the order the points were detected and the last row being all 1's
+    :param camera_oriented_tag_matrix:  the 4*4 matrix of the camera oriented position of 4 points with
+    the last row being all 1's
     :param field_oriented_tag_inverse_matrix: the inverse matrix of the 4*4 matrix that represents the field oriented
-    position of each corner of the tag with the order being the same as the order they are detected and the last row
-    being all 1's, you can compute this matrix one time for every tag before runtime as it is constant for each tag
+    position of each point in camera_oriented_tag_matrix and the last row being all 1's, you can compute this matrix one
+    time for every tag before runtime as it is constant for each tag
     :return: the camera extrinsic matrix (4*4)
     """
     return camera_oriented_tag_matrix @ field_oriented_tag_inverse_matrix
+
 
 def extrinsic_matrix_to_camera_position(extrinsic_matrix: np.ndarray) -> np.ndarray:
     """
     :param extrinsic_matrix: 4*4 extrinsic camera matrix
     :return: 3d vector representing
     """
-    inverse_rotation = np.linalg.inv(np.delete(np.delete(extrinsic_matrix, 3, 0), 3, 1))
-    return inverse_rotation @ extrinsic_matrix[:3, 3]
+    rotation_matrix = np.delete(np.delete(extrinsic_matrix, 3, 0), 3, 1)
+    det = np.linalg.det(rotation_matrix)
+    # rotation_matrix /= det
+    # inverse_rotation = np.linalg.inv(rotation_matrix*(det**(-1/3)))
+    inverse_rotation = np.linalg.inv(rotation_matrix)
+    return (inverse_rotation @ extrinsic_matrix[:3, 3])
+
+
 def extrinsic_matrix_to_rotation(extrinsic_matrix: np.ndarray) -> list[float]:
     """
     :param extrinsic_matrix: 4*4 extrinsic camera matrix
@@ -140,6 +195,7 @@ def extrinsic_matrix_to_rotation(extrinsic_matrix: np.ndarray) -> list[float]:
 
     return [x, y, z]
 
+
 def draw(frame: np.ndarray, proj_tags: list[list[list[int or float]]], ids: list[int]):
     """
     :param frame: the frame on which we want to draw the tags
@@ -157,8 +213,8 @@ def draw(frame: np.ndarray, proj_tags: list[list[list[int or float]]], ids: list
 
 def main():
     # TODO: check if focal length values are actually good
-    TAG_SIDE_LENGTH = 15.3
-    TAG_DIAG_LENGTH = TAG_SIDE_LENGTH * (2**0.5)
+    TAG_SIDE_LENGTH = 15.24
+    TAG_DIAG_LENGTH = TAG_SIDE_LENGTH * (2 ** 0.5)
 
     cv2.namedWindow("Display", cv2.WINDOW_AUTOSIZE)
     cam = cv2.VideoCapture(1)
@@ -167,28 +223,43 @@ def main():
     cam.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     cam.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     cam.set(cv2.CAP_PROP_FPS, 30)
-    diag = (width**2 + height**2)**0.5
+    diag = (width ** 2 + height ** 2) ** 0.5
     F_LENGTH_X_LIFECAM = math.tan(0.5355780593748425) * 2 * diag
     F_LENGTH_Y_LIFECAM = math.tan(0.3221767906849529) * 2 * diag
 
+    # this tag's center is located at (0, 0, 1)
+    debug_matrix = (TAG_SIDE_LENGTH/2)*np.array([[1, 0, 0, 0],
+                                                 [0, 1, 0, 0],
+                                                 [1, 0, 1, 0],
+                                                 np.array([1, 1, 1, 1]) / (TAG_SIDE_LENGTH / 2)])
     while True:
         ok, frame = cam.read()
-
-
-        proj_squares, ids = detect_april_tags(frame)
-        for square in proj_squares:
-            camera_oriented_coords = tag_projected_points_to_camera_oriented(tag=square, width=width,
-                                                                        height=height, diagonal_length=TAG_DIAG_LENGTH,
-                                                                        focal_length_x=F_LENGTH_X_LIFECAM,
-                                                                        focal_length_y=F_LENGTH_Y_LIFECAM)
-            # print(math.degrees(math.asin(0.5*((camera_oriented_coords[:3,0] + camera_oriented_coords[:3,2]) -
-            #       (camera_oriented_coords[:3,1] + camera_oriented_coords[:3,3]))[2] /
-            #       (0.5*(camera_oriented_coords[:3,1] + camera_oriented_coords[:3,3]))[2])))
-            print(np.linalg.norm(0.25*((camera_oriented_coords[:3,0] + camera_oriented_coords[:3,2]) +
-                   (camera_oriented_coords[:3,1] + camera_oriented_coords[:3,3]))))
-        draw(frame, proj_squares, ids)
-        cv2.imshow('Display', frame)
-        cv2.waitKey(1)
+        if ok:
+            proj_squares, ids = detect_april_tags(frame)
+            draw(frame, proj_squares, ids)
+            for square in proj_squares:
+                camera_oriented_coords = tag_projected_points_to_camera_oriented(tag=square, width=width,
+                                                                                 height=height,
+                                                                                 diagonal_length=TAG_DIAG_LENGTH,
+                                                                                 focal_length_x=F_LENGTH_X_LIFECAM,
+                                                                                 focal_length_y=F_LENGTH_Y_LIFECAM)
+                camera_oriented_axis_mat = corners_to_camera_oriented_axis_matrix(camera_oriented_coords,
+                                                                                  TAG_SIDE_LENGTH/2)
+                projected_z = project_point(camera_oriented_axis_mat[:3, 2], F_LENGTH_X_LIFECAM,
+                                            F_LENGTH_Y_LIFECAM, width, height)
+                cv2.circle(frame, (int(projected_z[0]), int(projected_z[1])), 5, [255, 0, 255], 5)
+                # print(math.degrees(math.asin(0.5*((camera_oriented_coords[:3,0] + camera_oriented_coords[:3,2]) -
+                #       (camera_oriented_coords[:3,1] + camera_oriented_coords[:3,3]))[2] /
+                #       (0.5*(camera_oriented_coords[:3,1] + camera_oriented_coords[:3,3]))[2])))
+                # print(np.linalg.norm(0.25 * ((camera_oriented_coords[:3, 0] + camera_oriented_coords[:3, 2]) +
+                #                              (camera_oriented_coords[:3, 1] + camera_oriented_coords[:3, 3]))))
+                # print(camera_oriented_coords)
+                extrinsic_matrix = camera_oriented_to_extrinsic_matrix(camera_oriented_axis_mat,
+                                                                       np.linalg.inv(debug_matrix))
+                cam_xyz = extrinsic_matrix_to_camera_position(extrinsic_matrix)
+                print(cam_xyz)
+            cv2.imshow('Display', frame)
+            cv2.waitKey(1)
 
 
 if __name__ == '__main__':
